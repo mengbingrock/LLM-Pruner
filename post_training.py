@@ -83,6 +83,19 @@ def main(args):
                 data_point["input"],
                 data_point["output"],
             )
+        elif 'legal' in args.data_path.lower():
+            tokens = tokenize(data_point["text"], truncation=True, padding=False)
+            
+            # Add the EOS token ID at the end of each tokenized input
+            eos_token_id = tokenizer.eos_token_id 
+            if eos_token_id is None:
+                raise ValueError("Your tokenizer does not have an eos_token_id. Please set an EOS token for your tokenizer.")
+            
+            # Append the EOS token to each sequence and update the attention mask
+            tokens["input_ids"] = tokens["input_ids"] + [eos_token_id]
+            tokens["attention_mask"] = tokens["attention_mask"] + [1]
+
+            return tokens
         else:
             raise NotImplementedError
 

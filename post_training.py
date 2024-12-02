@@ -43,10 +43,12 @@ def main(args):
     ddp = world_size != 1
     if ddp:
         gradient_accumulation_steps = gradient_accumulation_steps // world_size
+    
 
     if device == 'cuda':
         model.half()
 
+    gradient_accumulation_steps = 1
     tokenizer.pad_token_id = 0
     tokenizer.padding_side = "left"
 
@@ -69,6 +71,59 @@ def main(args):
         result["labels"] = result["input_ids"].copy()
 
         return result
+    
+    def tokenize_function(examples):
+        if True:
+            # Tokenize with truncation enabled but without padding
+            inputs  = tokenizer(examples["text"], padding=False)
+
+            if examples.get("answer", None):
+                answers = tokenizer(examples["answer"], padding=False)
+                # Add the EOS token ID at the end of each tokenized input
+                eos_token_id = tokenizer.eos_token_id 
+                if eos_token_id is None:
+                    raise ValueError("Your tokenizer does not have an eos_token_id. Please set an EOS token for your tokenizer.")
+                input_ids = inputs["input_ids"] + answers["input_ids"] + [eos_token_id]
+                attention_mask = inputs["attention_mask"] + answers["attention_mask"] + [1]
+                labels = input_ids
+            else:
+                input_ids = inputs["input_ids"]
+                attention_mask = inputs["attention_mask"]
+                labels = input_ids
+            
+            return {
+                'input_ids': input_ids,
+                'attention_mask': attention_mask,
+                'labels': labels
+            }
+        else:
+            # Ensure 'answer' key is present, otherwise handle it gracefully
+            if 'answer' not in examples:
+                raise ValueError("The 'answer' key is missing in the dataset but 'loss_on_answer' is set to True.")
+            
+            if examples["text"] is None or examples["answer"] is None:
+                print("Example with None value:", examples)
+        
+            inputs = tokenizer(examples["text"], padding=False)
+            answers = tokenizer(examples["answer"], padding=False)
+            
+            # Get EOS token ID
+            eos_token_id = tokenizer.eos_token_id
+            if eos_token_id is None:
+                raise ValueError("Your tokenizer does not have an eos_token_id. Please set an EOS token for your tokenizer.")
+            
+            # Concatenate input and answer
+            input_ids = inputs['input_ids'] + answers['input_ids'] + [eos_token_id]
+            attention_mask = inputs['attention_mask'] + answers['attention_mask'] + [1]
+            
+            # Create labels where the input part is masked with ignore_index 32000, and add EOS token
+            labels = [32000] * len(inputs['input_ids']) + answers['input_ids'] + [eos_token_id]
+            
+            return {
+                'input_ids': input_ids,
+                'attention_mask': attention_mask,
+                'labels': labels
+            }
 
     def generate_and_tokenize_prompt(data_point):
         if 'lamini' in args.data_path.lower():
@@ -83,6 +138,17 @@ def main(args):
                 data_point["input"],
                 data_point["output"],
             )
+        elif 'medical' in args.data_path.lower():
+            tokens = tokenize(data_point['text'] + data_point['answer'])
+            return tokens
+        
+        elif 'legal' in args.data_path.lower():
+            # legal has only 'text' in data
+            tokens = tokenize(data_point['text'])
+            
+            #import time; time.sleep(3)
+            return tokens
+            
         else:
             raise NotImplementedError
 
@@ -118,9 +184,61 @@ def main(args):
                 'labels': batch
             })
         return test_set
+    if os.path.exists(args.data_path):
+        from datasets import load_from_disk
+        print('load from local file')
+        data = load_from_disk(args.data_path)
+    else:
+        print('load from hf')
+        data = load_dataset(args.data_path)
+    
+    
+    if args.cache_dataset and os.path.exists('datasets/cache/{}.bin'.format(args.data_path)):
+        preprocess_data = torch.load('datasets/cache/{}.bin'.format(args.data_path))
+        train_data, val_data = preprocess_data['train'], preprocess_data['val']
+        
+        print('==============val data begin ===========')
+        print(train_val["test"][0])
+        print('==============val data end ===========')
+    else:
+        train_val = data["train"].train_test_split(
+            test_size=0.01, shuffle=True, seed=42
+        )
+        print('==============val data begin ===========')
+        print(train_val["test"][0])
+        print('==============val data end ===========')
+        train_data = (
+            train_val["train"].shuffle().map(generate_and_tokenize_prompt)
+        )
+        print('=============train data after tokenize======')
+        if 'answer' in train_data.features.keys():
+            train_data = train_data.remove_columns(['text', 'answer'])
+        else:
+            train_data = train_data.remove_columns(['text']) 
+            print(train_data[0])
+        val_data = (train_val["test"].shuffle().map(generate_and_tokenize_prompt))
+        
+       
+        print('=============val data after tokenize======')
+        print(val_data[0])
+        if 'answer' in val_data.features.keys():
+            val_data = val_data.remove_columns(['text', 'answer'])
+        else:
+            val_data = val_data.remove_columns(['text'])
+        
+        if args.cache_dataset and args.local_rank == 0:
+            cache_file = 'datasets/cache/{}.bin'.format(args.data_path)
+            cache_dir = '/'.join(cache_file.split('/')[:-1])
+            directory = Path(cache_dir)
+            directory.mkdir(parents=True, exist_ok=True)
 
+            torch.save({
+                'train': train_data, 'val': val_data
+            }, cache_file)
+            
+            
     # Prepare For LoRA
-    model = prepare_model_for_int8_training(model)
+    # model = prepare_model_for_int8_training(model)
     config = LoraConfig(
         r=args.lora_r,
         lora_alpha=args.lora_alpha,
@@ -129,9 +247,12 @@ def main(args):
         bias="none",
         task_type="CAUSAL_LM",
     )
+    model.gradient_checkpointing_enable()
     model = get_peft_model(model, config)
+    model.enable_input_require_grads()
     model.print_trainable_parameters()  
 
+    '''
     # Load Train Dataset
     data = load_dataset(args.data_path)
     if args.cache_dataset and os.path.exists('datasets/cache/{}.bin'.format(args.data_path)):
@@ -156,6 +277,7 @@ def main(args):
             torch.save({
                 'train': train_data, 'val': val_data
             }, cache_file)
+    '''
 
     # Load Extra Validation Dataset
     if args.extra_val_dataset:
@@ -176,7 +298,7 @@ def main(args):
         train_dataset=train_data,
         eval_dataset=val_data,
         args=transformers.TrainingArguments(
-            per_device_train_batch_size=args.micro_batch_size,
+            per_device_train_batch_size=args.batch_size,
             gradient_accumulation_steps=gradient_accumulation_steps,
             warmup_steps=100,
             num_train_epochs=args.num_epochs,
@@ -187,8 +309,8 @@ def main(args):
             optim="adamw_torch",
             evaluation_strategy="steps",
             save_strategy="steps",
-            eval_steps=100,
-            save_steps=200,
+            eval_steps=100000,
+            save_steps=100000,
             output_dir=args.output_dir,
             save_total_limit=20,
             load_best_model_at_end=True,
@@ -197,9 +319,10 @@ def main(args):
             report_to="wandb",
             run_name=args.output_dir.split('/')[-1],
             metric_for_best_model="{}_loss".format(args.data_path),
+            gradient_checkpointing=True,
         ),
         data_collator=transformers.DataCollatorForSeq2Seq(
-            tokenizer, pad_to_multiple_of=8, return_tensors="pt", padding=True
+            tokenizer, return_tensors="pt", padding=True
         ),
     )
     model.config.use_cache = False
@@ -229,18 +352,18 @@ if __name__ == "__main__":
 
     # Training Hyperparameters
     parser.add_argument('--batch_size', type=int, default=128, help='batch size')
-    parser.add_argument('--micro_batch_size', type=int, default=4, help='micro batch size')
+    parser.add_argument('--micro_batch_size', type=int, default=1, help='micro batch size')
     parser.add_argument('--num_epochs', type=int, default=5, help='number of epochs')
     parser.add_argument('--learning_rate', type=float, default=3e-4, help='learning rate')
-    parser.add_argument('--cutoff_len', type=int, default=256, help='cutoff length')
+    parser.add_argument('--cutoff_len', type=int, default=4096000, help='cutoff length')
     parser.add_argument('--val_set_size', type=int, default=2000, help='validation set size')
     parser.add_argument('--prompt_template_name', type=str, default="alpaca", help="The prompt template to use, will default to alpaca.")
     parser.add_argument('--no_instruction', action='store_true', default=False, help="Whether to use the instruction template or not.")
 
     # Lora Configuration
     parser.add_argument('--lora_r', type=int, default=8, help='lora r')
-    parser.add_argument('--lora_alpha', type=int, default=16, help='lora alpha')
-    parser.add_argument('--lora_dropout', type=float, default=0.05, help='lora dropout')
+    parser.add_argument('--lora_alpha', type=int, default=1, help='lora alpha')
+    parser.add_argument('--lora_dropout', type=float, default=0.1, help='lora dropout')
     parser.add_argument('--lora_target_modules', type=str, default="q_proj,k_proj,v_proj,o_proj,gate_proj,down_proj,up_proj", help='lora target modules')
 
     # llm hyperparameters
